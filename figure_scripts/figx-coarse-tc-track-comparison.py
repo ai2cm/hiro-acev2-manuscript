@@ -7,8 +7,13 @@ distribution of per-track maximum 10m wind speed.
 Merges ``figx-coarse-datasets-tc-track-density.py`` (maps) and
 ``figx-coarse-tc-max-wind-histograms.py`` (histogram), which read the same
 two CSVs.
+
+Each dataset's plot data (density grid, tracks per year, per-track peak wind)
+is cached in ``plot_data_cache/figx-coarse-tc-track-comparison/<track dir>.npz``;
+pass ``--refresh`` to recompute it from the ``tracks.csv`` files.
 """
 
+import argparse
 from pathlib import Path
 
 import cartopy.crs as ccrs
@@ -18,12 +23,16 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import to_rgba
 
+from plot_cache import MAIN_FIGURES_DIR, cached_arrays
 from series_colors import HIRO_ACE_COLOR, REFERENCE_COLOR
 
 HERE = Path(__file__).parent
+# Track CSVs are read from the parent figure directory, only when the cache
+# below is missing.
+PARENT = HERE.parent
 DATASETS = {
-    "X-SHiELD": HERE / "track_detection" / "xshield-reference" / "tracks.csv",
-    "ACE2S-X-SHiELD": HERE / "track_detection" / "ace2s-shieldplus-best-inf-ckpt-10yr-rollout" / "tracks.csv",
+    "X-SHiELD": PARENT / "track_detection" / "xshield-reference" / "tracks.csv",
+    "ACE2S-X-SHiELD": PARENT / "track_detection" / "ace2s-shieldplus-best-inf-ckpt-10yr-rollout" / "tracks.csv",
 }
 REFERENCE = "X-SHiELD"
 COLORS = {
@@ -45,7 +54,8 @@ CBAR_WIDTH = 0.012
 CBAR_PAD = 0.012
 # Room for a colorbar's rotated label plus the next panel's y-axis.
 CBAR_LABEL_GAP = 0.105
-OUT_PATH = HERE / "main_figures" / "coarse_tc_track_comparison.png"
+OUT_PATH = MAIN_FIGURES_DIR / "coarse_tc_track_comparison.png"
+CACHE_SUBDIR = Path(__file__).stem
 
 
 def track_days_per_year(df: pd.DataFrame) -> np.ndarray:
@@ -58,6 +68,24 @@ def yearly_track_counts(df: pd.DataFrame) -> pd.Series:
     """Number of distinct tracks starting in each calendar year."""
     track_years = df.groupby("track_id")["time"].min().dt.year
     return track_years.value_counts().sort_index()
+
+
+def load_plot_data(path: Path, refresh: bool = False) -> dict:
+    """``{density, yearly_track_counts, peak_wind}`` for one ``tracks.csv``."""
+
+    def compute() -> dict:
+        # xshield-output-tracks/tracks.csv has already had its first year
+        # (2013-01-12 to 2014-01-12) trimmed so both runs cover a comparable
+        # span starting 2014-01-12.
+        df = pd.read_csv(path, parse_dates=["time"])
+        return {
+            "density": track_days_per_year(df),
+            "yearly_track_counts": yearly_track_counts(df).to_numpy(),
+            "peak_wind": df.groupby("track_id")["wind"].max().to_numpy(),
+        }
+
+    # Named after the track-detection directory, e.g. "xshield-reference".
+    return cached_arrays(f"{CACHE_SUBDIR}/{path.parent.name}.npz", compute, refresh)
 
 
 def plot_map(ax, field: np.ndarray, title: str, subtitle: str, **kwargs) -> object:
@@ -76,11 +104,8 @@ def plot_map(ax, field: np.ndarray, title: str, subtitle: str, **kwargs) -> obje
     return mesh
 
 
-def plot_wind_histogram(ax, frames: dict) -> None:
-    peaks = {
-        name: df.groupby("track_id")["wind"].max() for name, df in frames.items()
-    }
-    all_values = pd.concat(peaks.values())
+def plot_wind_histogram(ax, peaks: dict) -> None:
+    all_values = np.concatenate(list(peaks.values()))
     n_bins = int((all_values.max() // WIND_BIN_WIDTH) + 2)
     bins = [i * WIND_BIN_WIDTH for i in range(n_bins + 1)]
 
@@ -102,17 +127,20 @@ def plot_wind_histogram(ax, frames: dict) -> None:
 
 
 def main() -> None:
-    frames = {}
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--refresh", action="store_true", help="Recompute the cached plot data."
+    )
+    args = parser.parse_args()
+
+    peaks = {}
     densities = {}
     track_stats = {}
     for title, path in DATASETS.items():
-        # xshield-output-tracks/tracks.csv has already had its first year
-        # (2013-01-12 to 2014-01-12) trimmed so both runs cover a comparable
-        # span starting 2014-01-12.
-        df = pd.read_csv(path, parse_dates=["time"])
-        frames[title] = df
-        densities[title] = track_days_per_year(df)
-        counts = yearly_track_counts(df)
+        data = load_plot_data(path, args.refresh)
+        peaks[title] = data["peak_wind"]
+        densities[title] = data["density"]
+        counts = pd.Series(data["yearly_track_counts"])
         track_stats[title] = (counts.mean(), counts.std())
 
     reference = densities[REFERENCE]
@@ -165,7 +193,7 @@ def main() -> None:
     )
 
     hist_ax = fig.add_subplot(gs[1, 1])
-    plot_wind_histogram(hist_ax, frames)
+    plot_wind_histogram(hist_ax, peaks)
 
     density_cbar = fig.colorbar(
         mesh,

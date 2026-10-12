@@ -12,9 +12,13 @@ Covers two case studies, sharing the same layout/build code:
     - Bora event (2023-01-26T12:00): Adriatic katabatic outflow through the
       Gulf of Rijeka, cold/gravity-driven -- see
       scripts/find_katabatic_cold_winds.py for the detection that found it.
+
+The cropped event fields and terrain each figure draws are cached per event in
+plot_data_cache/figx-downslope-wind-events/; pass --refresh to recompute them
+from the event/coarse/topography stores.
 """
 
-import sys
+import argparse
 from pathlib import Path
 
 import cartopy.crs as ccrs
@@ -26,15 +30,13 @@ import xarray as xr
 from cartopy.mpl.gridliner import LATITUDE_FORMATTER, LONGITUDE_FORMATTER
 from scipy import ndimage
 
-# plot_event_snapshot.py lives in wind_analysis/, not next to this
-# script, so it isn't importable without adding that directory to the path.
-sys.path.insert(0, str(Path(__file__).parent / "wind_analysis"))
+# A copy of wind_analysis/plot_event_snapshot.py, kept next to this script.
 import plot_event_snapshot as pes
 
 from bicubic_interp import bicubic_to_grid
+from plot_cache import MAIN_FIGURES_DIR as OUT_DIR, SUPPLEMENTS_DIR, cached_dataset
 
-OUT_DIR = Path(__file__).parent / "main_figures"
-SUPPLEMENTS_DIR = Path(__file__).parent / "supplements"
+CACHE_SUBDIR = "figx-downslope-wind-events"
 EVENTS_DIR = Path(
     "/climate-default/2026-08-03-hiro-ace-v2-outputs/2026-08-07-hiro-perfect-pred-events"
 )
@@ -603,6 +605,27 @@ def add_bicubic_wind(event, coarse, date):
     return event
 
 
+# Event fields the figures draw: wind speed for the maps and histogram, and
+# the components behind the wind-blob arrows.
+PLOT_VAR_PREFIXES = ("wind_speed_", "eastward_wind_at_ten_meters_", "northward_wind_at_ten_meters_")
+
+
+def event_plot_data(event, topography):
+    """The cropped wind fields plus the terrain, in one dataset. The terrain
+    is on the (much finer) 3km grid, so it gets its own topo_lat/topo_lon
+    dims rather than sharing the event's lat/lon."""
+    fields = event[[v for v in event.data_vars if v.startswith(PLOT_VAR_PREFIXES)]]
+    ds = fields.load()
+    ds["topography"] = topography.rename({"lat": "topo_lat", "lon": "topo_lon"})
+    return ds
+
+
+def split_plot_data(ds):
+    """Inverse of `event_plot_data`: (event, topography)."""
+    topography = ds["topography"].rename({"topo_lat": "lat", "topo_lon": "lon"})
+    return ds.drop_dims(["topo_lat", "topo_lon"]), topography
+
+
 # ---------------------------------------------------------------------------
 # Santa Ana event (Southern California, warm/foehn downslope windstorm)
 # ---------------------------------------------------------------------------
@@ -678,7 +701,7 @@ def draw_city_labels(ax, cities, fontsize=15, color="white", dot_size=120):
             text.set_path_effects([pe.withStroke(linewidth=2.5, foreground=stroke_color)])
 
 
-def make_santa_ana_figure():
+def santa_ana_plot_data():
     coarse = pes.get_coarse_data(pes.DEFAULT_COARSE_PATHS)
     lat_min, lat_max, lon_min, lon_max = corridor_coarse_bbox(
         coarse.grid_yt.values, coarse.grid_xt.values
@@ -687,6 +710,13 @@ def make_santa_ana_figure():
         SANTA_ANA_NC_PATH, lat_min, lat_max, lon_min, lon_max, coarse
     )
     topography = load_topography(lat_min, lat_max, lon_min, lon_max)
+    return event_plot_data(event, topography)
+
+
+def make_santa_ana_figure(refresh=False):
+    event, topography = split_plot_data(
+        cached_dataset(f"{CACHE_SUBDIR}/santa_ana_event.nc", santa_ana_plot_data, refresh)
+    )
 
     fig = build_region_figure(
         event,
@@ -759,13 +789,20 @@ def event_coarse_bbox(coarse_lat, coarse_lon, lat, lon, n_rows=2, n_cols=3):
     return lat_edges[r_lo], lat_edges[r_hi + 1], lon_edges[c_lo], lon_edges[c_hi + 1]
 
 
-def make_bora_figure():
+def bora_plot_data():
     coarse = pes.get_coarse_data(pes.DEFAULT_COARSE_PATHS)
     lat_min, lat_max, lon_min, lon_max = event_coarse_bbox(
         coarse.grid_yt.values, coarse.grid_xt.values, BORA_EVENT_LAT, BORA_EVENT_LON
     )
     event = _load_cropped_event(BORA_NC_PATH, lat_min, lat_max, lon_min, lon_max, coarse)
     topography = load_topography(lat_min, lat_max, lon_min, lon_max)
+    return event_plot_data(event, topography)
+
+
+def make_bora_figure(refresh=False):
+    event, topography = split_plot_data(
+        cached_dataset(f"{CACHE_SUBDIR}/bora_event.nc", bora_plot_data, refresh)
+    )
 
     fig = build_region_figure(
         event,
@@ -800,10 +837,15 @@ def make_bora_figure():
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--refresh", action="store_true", help="recompute the cached plot data"
+    )
+    args = parser.parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     SUPPLEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    make_santa_ana_figure()
-    make_bora_figure()
+    make_santa_ana_figure(args.refresh)
+    make_bora_figure(args.refresh)
 
 
 if __name__ == "__main__":

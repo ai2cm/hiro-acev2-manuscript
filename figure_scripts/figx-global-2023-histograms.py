@@ -1,9 +1,11 @@
+import argparse
 import os
 
 import xarray as xr
 import matplotlib.pyplot as plt
 import numpy as np
 
+from plot_cache import MAIN_FIGURES_DIR, cached_arrays
 from series_colors import HIRO_ACE_COLOR, PERFECT_PRED_COLOR, REFERENCE_COLOR
 
 ROOT = (
@@ -15,6 +17,17 @@ HIRO_ACE_ROOT = (
     "2026-08-03-hiro-ace-global-2023"
 )
 PERCENTILES = (99.99, 99.9999)
+# one npz per series under plot_data_cache/, holding each variable's trimmed
+# counts and edges as "<var>_counts" / "<var>_edges"
+CACHE_SUBDIR = "figx-global-2023-histograms"
+# the five panels, in figure order (three on top, two below)
+PANEL_VARS = [
+    "PRATEsfc",
+    "wind_speed",
+    "PRMSL",
+    "eastward_wind_at_ten_meters",
+    "northward_wind_at_ten_meters",
+]
 COLORS = {
     "reference": REFERENCE_COLOR,
     "prediction": PERFECT_PRED_COLOR,
@@ -151,14 +164,38 @@ ABLATION_SERIES = [
 ]
 
 
-def plot_histogram(ax, var, series_specs, labels=LABELS):
+def load_series_histograms(spec, refresh=False):
+    """``{var: (counts, edges)}`` for one series spec, trimmed of empty end bins.
+
+    Read from ``plot_data_cache/<CACHE_SUBDIR>/<name>.npz`` if present, else
+    from the series' histogram files and saved there.
+    """
+    name, root, subdir, *rest = spec
+    (only_vars,) = rest or (None,)
+    variables = [v for v in PANEL_VARS if only_vars is None or v in only_vars]
+
+    def compute():
+        arrays = {}
+        for var in variables:
+            ds = open_histogram(root, subdir, var)
+            counts, edges = trim_empty_bins(ds.counts.values, ds.edges.values)
+            arrays[f"{var}_counts"] = counts
+            arrays[f"{var}_edges"] = edges
+        return arrays
+
+    arrays = cached_arrays(f"{CACHE_SUBDIR}/{name}.npz", compute, refresh)
+    return {
+        var: (arrays[f"{var}_counts"], arrays[f"{var}_edges"]) for var in variables
+    }
+
+
+def plot_histogram(ax, var, series_specs, histograms, labels=LABELS):
     series = {}
     for name, root, subdir, *rest in series_specs:
         (only_vars,) = rest or (None,)
         if only_vars is not None and var not in only_vars:
             continue
-        ds = open_histogram(root, subdir, var)
-        counts, edges = trim_empty_bins(ds.counts.values, ds.edges.values)
+        counts, edges = histograms[name][var]
         if var == "PRATEsfc":
             edges = edges * 86400  # kg/m2/s -> mm/day
         series[name] = (counts, edges)
@@ -242,7 +279,7 @@ FONTS = {
 }
 
 
-def build_main_figure(series_specs, out_path, labels=LABELS):
+def build_main_figure(series_specs, out_path, histograms, labels=LABELS):
     """Five histogram panels, three on top and two below.
 
     The bottom panels sit under the first two top columns and the legend fills
@@ -255,16 +292,10 @@ def build_main_figure(series_specs, out_path, labels=LABELS):
         axes = []
         for spec, var in zip(
             [gs[0, 0], gs[0, 1], gs[0, 2], gs[1, 0], gs[1, 1]],
-            [
-                "PRATEsfc",
-                "wind_speed",
-                "PRMSL",
-                "eastward_wind_at_ten_meters",
-                "northward_wind_at_ten_meters",
-            ],
+            PANEL_VARS,
         ):
             ax = fig.add_subplot(spec)
-            plot_histogram(ax, var, series_specs, labels=labels)
+            plot_histogram(ax, var, series_specs, histograms, labels=labels)
             axes.append(ax)
 
         legend_ax = fig.add_subplot(gs[1, 2])
@@ -278,9 +309,27 @@ def build_main_figure(series_specs, out_path, labels=LABELS):
         save_figure(fig, out_path)
 
 
-build_main_figure(MAIN_SERIES, "main_figures/figx-global-2023-histograms.png")
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--refresh",
+    action="store_true",
+    help="recompute the cached histograms from the source histogram files",
+)
+args = parser.parse_args()
+
+# both figures share the reference and perfect-prediction series, so each
+# series is loaded once
+histograms = {}
+for spec in MAIN_SERIES + ABLATION_SERIES:
+    if spec[0] not in histograms:
+        histograms[spec[0]] = load_series_histograms(spec, refresh=args.refresh)
+
+build_main_figure(
+    MAIN_SERIES, MAIN_FIGURES_DIR / "figx-global-2023-histograms.png", histograms
+)
 build_main_figure(
     ABLATION_SERIES,
-    "main_figures/global-2023-histograms-pp-ablation.png",
+    MAIN_FIGURES_DIR / "global-2023-histograms-pp-ablation.png",
+    histograms,
     labels=ABLATION_LABELS,
 )

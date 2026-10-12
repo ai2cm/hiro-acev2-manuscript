@@ -10,13 +10,17 @@ The per-site u/v time series are the expensive part (every X-SHiELD timestep
 is a full ~57MB chunk read), so they're cached to CACHE_PATH; the rose
 histograms themselves are recomputed from the cache on every run. X-SHiELD is
 extracted a year at a time into XSHIELD_PART_DIR so an interrupted run
-resumes where it left off. Delete the cache files to re-extract.
+resumes where it left off. Delete the cache files (or pass --refresh) to
+re-extract.
 
-The cache also holds Trieste, used by ad_hoc/figx-bora-wind-rose-3panel.py
-(both sites); all series share the timestamps common to every dataset in
+Unlike the parent directory's version (whose cache also holds Trieste for
+ad_hoc/figx-bora-wind-rose-3panel.py), only the drawn site is extracted and
+cached, and the per-year X-SHiELD parts are deleted once the merged cache is
+written. All series share the timestamps common to every dataset in
 CACHE_DATASETS.
 """
 
+import argparse
 from pathlib import Path
 
 import dask
@@ -24,6 +28,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import BoundaryNorm, ListedColormap
 import numpy as np
 import xarray as xr
+
+from plot_cache import CACHE_DIR as PLOT_DATA_CACHE_DIR, MAIN_FIGURES_DIR
 
 BORA_REGION_DIR = (
     "/climate-default/2026-08-03-hiro-ace-v2-outputs/2026-10-01-downscale-bora-region"
@@ -36,16 +42,15 @@ START, STOP = "2014-01-01", "2023-12-31 23:59"
 YEARS = range(2014, 2024)
 
 FIG_DIR = Path(__file__).parent
-OUT_DIR = FIG_DIR / "main_figures"
+OUT_DIR = MAIN_FIGURES_DIR
 OUT_PATH = OUT_DIR / "hiro_ace_wind_rose.png"
-CACHE_DIR = FIG_DIR / "wind_rose_cache"
-CACHE_PATH = CACHE_DIR / "senj_trieste_wind_2014-2023.nc"
+CACHE_DIR = PLOT_DATA_CACHE_DIR / "wind_rose_cache"
+CACHE_PATH = CACHE_DIR / "senj_wind_2014-2023.nc"
 XSHIELD_PART_DIR = CACHE_DIR / "xshield_2014-2023_parts"
 
 # Same site coordinates as figx-downslope-wind-events.py's BORA_CITIES.
 SITES = {
     "Senj": (44.99, 14.90),
-    "Trieste": (45.65, 13.78),
 }
 
 # label -> (zarr path, u name, v name, lat name, lon name)
@@ -103,15 +108,15 @@ def compute(series: dict) -> xr.Dataset:
     return xr.Dataset({k: v.load() for k, v in computed.items()})
 
 
-def extract_xshield(ds: xr.Dataset) -> xr.Dataset:
-    """X-SHiELD site series, one cached part per year. Both sites share one
+def extract_xshield(ds: xr.Dataset, refresh: bool = False) -> xr.Dataset:
+    """X-SHiELD site series, one cached part per year. All sites share one
     X-SHiELD chunk per timestep, so computing them in a single call lets dask
-    read each chunk once for all four series."""
+    read each chunk once for every series."""
     XSHIELD_PART_DIR.mkdir(parents=True, exist_ok=True)
     parts = []
     for year in YEARS:
         part_path = XSHIELD_PART_DIR / f"{year}.nc"
-        if not part_path.exists():
+        if refresh or not part_path.exists():
             year_ds = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31 23:59"))
             print(f"Extracting X-SHiELD {year} ({year_ds.sizes['time']} timesteps)")
             compute(site_points("X-SHiELD", year_ds)).to_netcdf(part_path)
@@ -121,28 +126,33 @@ def extract_xshield(ds: xr.Dataset) -> xr.Dataset:
     return xr.concat(parts, dim="time")
 
 
-def extract_site_winds() -> xr.Dataset:
+def extract_site_winds(refresh: bool = False) -> xr.Dataset:
     """u/v at the nearest grid cell to each site, on the timestamps all
     datasets share in 2014-2023."""
     opened = {name: open_period(spec[0]) for name, spec in CACHE_DATASETS.items()}
     common = sorted(set.intersection(*(set(ds.time.values) for ds in opened.values())))
     print(f"{len(common)} common 2014-2023 timesteps")
 
-    out = [extract_xshield(opened["X-SHiELD"].sel(time=common))]
+    out = [extract_xshield(opened["X-SHiELD"].sel(time=common), refresh)]
     for name, ds in opened.items():
         if name != "X-SHiELD":
             out.append(compute(site_points(name, ds.sel(time=common))))
     return xr.merge(out, join="exact")
 
 
-def load_site_winds() -> xr.Dataset:
-    if CACHE_PATH.exists():
+def load_site_winds(refresh: bool = False) -> xr.Dataset:
+    if CACHE_PATH.exists() and not refresh:
         print(f"Loading cached winds: {CACHE_PATH}")
         return xr.open_dataset(CACHE_PATH, decode_times=xr.coders.CFDatetimeCoder(use_cftime=True))
-    winds = extract_site_winds()
+    winds = extract_site_winds(refresh)
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     winds.to_netcdf(CACHE_PATH)
     print(f"Saved cache: {CACHE_PATH}")
+    # The parts only exist to make an interrupted extraction resumable; once
+    # the merged cache is written they duplicate it.
+    for part_path in XSHIELD_PART_DIR.glob("*.nc"):
+        part_path.unlink()
+    XSHIELD_PART_DIR.rmdir()
     return winds
 
 
@@ -185,10 +195,12 @@ def add_panel_label(ax, label: str) -> None:
             fontsize=11, fontweight="bold")
 
 
-def make_figure(datasets: list[str], out_path: Path, sites: list[str] = list(SITES)) -> None:
+def make_figure(
+    datasets: list[str], out_path: Path, sites: list[str] = list(SITES), refresh: bool = False
+) -> None:
     """One row of roses per site; the site name is left out of the panel
     titles when there's only one row."""
-    winds = load_site_winds()
+    winds = load_site_winds(refresh)
 
     n_rows, n_roses = len(sites), len(datasets)
     fig = plt.figure(figsize=(3.8 * n_roses + 1.2, 4.1 * n_rows))
@@ -242,7 +254,12 @@ def make_figure(datasets: list[str], out_path: Path, sites: list[str] = list(SIT
 
 
 def main():
-    make_figure(DATASETS, OUT_PATH, PLOT_SITES)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--refresh", action="store_true", help="re-extract the cached site winds"
+    )
+    args = parser.parse_args()
+    make_figure(DATASETS, OUT_PATH, PLOT_SITES, refresh=args.refresh)
 
 
 if __name__ == "__main__":

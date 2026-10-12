@@ -45,7 +45,10 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import xarray as xr
+
+from plot_cache import CACHE_DIR as PLOT_DATA_CACHE, MAIN_FIGURES_DIR, cached_frame
 
 HERE = Path(__file__).parent
 COARSE_ACE2S_DATASET_ROOT = (
@@ -60,10 +63,12 @@ PREDICTION_LABEL = "ACE2S-X-SHiELD"
 START, END = "2014-01-01", "2023-12-31"
 # PRATEsfc is kg/m**2/s; 86400 converts to the conventional mm/day.
 SECONDS_PER_DAY = 86400.0
-MEMBERS = sorted(Path(COARSE_ACE2S_DATASET_ROOT).glob("output_6hourly_predictions_ic*.zarr"))
 
-CACHE_DIR = HERE / "time_mean_cache"
-PRECIP_CACHE = HERE / "precip_time_means.nc"
+CACHE_DIR = PLOT_DATA_CACHE / "time_mean_cache"
+PRECIP_CACHE = PLOT_DATA_CACHE / "precip_time_means.nc"
+# The member stores found under COARSE_ACE2S_DATASET_ROOT, recorded so that
+# drawing from the cache never has to list the source directory.
+MEMBERS_CACHE = "figx-global-coarse-res-multifield-bias/members.csv"
 
 # The reference store names its horizontal coordinates after the FV3 grid; the
 # prediction store already uses lat/lon.
@@ -160,10 +165,13 @@ def _cache_path(tag: str, source: str) -> Path:
     return CACHE_DIR / f"{tag}_{source}_{START}_{END}.nc"
 
 
-def cached_source(path: Path | str, tag: str, source: str, is_reference: bool) -> xr.Dataset:
+def cached_source(
+    path: Path | str, tag: str, source: str, is_reference: bool, refresh: bool = False
+) -> xr.Dataset:
     """``compute_source`` memoised on disk, so an interrupted run resumes."""
     out = _cache_path(tag, source)
-    if out.exists():
+    if out.exists() and not refresh:
+        print(f"loading plot data from {out}", flush=True)
         return xr.open_dataset(out).load()
     print(f"computing {source} time mean: {tag}", flush=True)
     means = compute_source(path, source, is_reference)
@@ -205,24 +213,48 @@ def _seed_precip_cache_from_sibling() -> None:
             print(f"seeded {out} from {PRECIP_CACHE.name}", flush=True)
 
 
-def _task(args: tuple[str, str, str, bool]) -> str:
-    path, tag, source, is_reference = args
-    cached_source(path, tag, source, is_reference)
+def _task(args: tuple[str, str, str, bool, bool]) -> str:
+    path, tag, source, is_reference, refresh = args
+    cached_source(path, tag, source, is_reference, refresh)
     return f"{tag}:{source}"
 
 
-def gather_time_means(workers: int) -> tuple[xr.Dataset, xr.Dataset]:
+def member_stores(refresh: bool = False) -> pd.DataFrame:
+    """Tag and path of every ACE2S member store, one row each, in tag order."""
+
+    def compute() -> pd.DataFrame:
+        # ic???? rather than ic*: the root also holds output_6hourly_predictions_
+        # ic0000_2023-onward.zarr, a 1-year continuation of ic0000, not a member.
+        paths = sorted(
+            Path(COARSE_ACE2S_DATASET_ROOT).glob("output_6hourly_predictions_ic????.zarr")
+        )
+        return pd.DataFrame(
+            {"tag": [p.stem.split("_")[-1] for p in paths], "path": [str(p) for p in paths]}
+        )
+
+    return cached_frame(MEMBERS_CACHE, compute, refresh, dtype=str)
+
+
+def gather_time_means(workers: int, refresh: bool = False) -> tuple[xr.Dataset, xr.Dataset]:
     """Reference and per-member time means for every field, as two Datasets.
 
     Members are stacked along a ``member`` dimension labelled by initial-condition
     tag (ic0000, ...), so the arrays are self-describing.
     """
-    _seed_precip_cache_from_sibling()
+    members_table = member_stores(refresh)
+    if not refresh:
+        _seed_precip_cache_from_sibling()
 
     sources = tuple(FIELDS_BY_SOURCE)
-    tasks = [(COARSENED_XSHIELD_REFERENCE_DATASET, "reference", s, True) for s in sources]
-    tasks += [(str(p), p.stem.split("_")[-1], s, False) for p in MEMBERS for s in sources]
-    pending = [t for t in tasks if not _cache_path(t[1], t[2]).exists()]
+    tasks = [
+        (COARSENED_XSHIELD_REFERENCE_DATASET, "reference", s, True, refresh) for s in sources
+    ]
+    tasks += [
+        (path, tag, s, False, refresh)
+        for tag, path in zip(members_table.tag, members_table.path)
+        for s in sources
+    ]
+    pending = [t for t in tasks if refresh or not _cache_path(t[1], t[2]).exists()]
 
     if pending:
         # The reduction is latency-bound, so the passes overlap in separate
@@ -239,9 +271,10 @@ def gather_time_means(workers: int) -> tuple[xr.Dataset, xr.Dataset]:
         return xr.merge(parts)[[f.key for f in FIELDS]]
 
     reference = collect(COARSENED_XSHIELD_REFERENCE_DATASET, "reference", True)
-    labels = [p.stem.split("_")[-1] for p in MEMBERS]
+    labels = list(members_table.tag)
     members = xr.concat(
-        [collect(str(p), tag, False) for p, tag in zip(MEMBERS, labels)], dim="member"
+        [collect(path, tag, False) for path, tag in zip(members_table.path, labels)],
+        dim="member",
     ).assign_coords(member=labels)
     return reference, members
 
@@ -374,7 +407,7 @@ def plot_multifield(reference: xr.Dataset, members: xr.Dataset) -> Path:
 
     headers = (
         REFERENCE_LABEL,
-        f"{PREDICTION_LABEL} ensemble mean ({len(MEMBERS)} members)",
+        f"{PREDICTION_LABEL} ensemble mean ({members.sizes['member']} members)",
         f"{PREDICTION_LABEL} minus {REFERENCE_LABEL}",
     )
     # Above the first-row titles, so the
@@ -390,7 +423,8 @@ def plot_multifield(reference: xr.Dataset, members: xr.Dataset) -> Path:
             ha="center", va="bottom", fontsize=14,
         )
 
-    out_path = HERE / "main_figures/global_coarse_res_multifield_bias.png"
+    out_path = MAIN_FIGURES_DIR / "global_coarse_res_multifield_bias.png"
+    out_path.parent.mkdir(exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches="tight", transparent=True)
     plt.close(fig)
     return out_path
@@ -404,9 +438,14 @@ def main() -> None:
         default=12,
         help="how many (source, store) passes to run concurrently",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="recompute and overwrite the cached member list and time means",
+    )
     args = parser.parse_args()
 
-    reference, members = gather_time_means(args.workers)
+    reference, members = gather_time_means(args.workers, args.refresh)
     print(f"Wrote {plot_multifield(reference, members)}")
 
 

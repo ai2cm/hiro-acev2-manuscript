@@ -13,10 +13,12 @@ are identical) and the plotting is reproduced here to save at 300 dpi on a
 transparent background.
 
 The series (the slow part -- every reference box is a read from the 3km
-zarrs) are cached to CACHE_PATH; the figure is redrawn from the cache on every
-run. Delete the cache file to recompute.
+zarrs) are cached to CACHE_PATH (under ``plot_data_cache/``); the figure is
+redrawn from the cache on every run. Delete the cache file, or pass
+``--refresh``, to recompute.
 """
 
+import argparse
 import importlib.util
 from pathlib import Path
 
@@ -25,13 +27,14 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from plot_cache import CACHE_DIR, SUPPLEMENTS_DIR
+
 TC_TRACKS_PROD_DIR = Path("/climate-default/home/annak/explore2/annak/2026-07-16-tc-tracks-prod")
 EVENT_DIR = Path("/climate-default/home/annak/2026-07-17-perfect-pred-tc-tracks-2023-holdout")
 EVENT = "north_atlantic_000"
 
-FIG_DIR = Path(__file__).parent
-OUT_PATH = FIG_DIR / "supplements" / "perfect_pred_tc_timeseries.png"
-CACHE_PATH = FIG_DIR / "tc_timeseries_cache" / f"perfect_pred_{EVENT}_timeseries.nc"
+OUT_PATH = SUPPLEMENTS_DIR / "perfect_pred_tc_timeseries.png"
+CACHE_PATH = CACHE_DIR / "tc_timeseries_cache" / f"perfect_pred_{EVENT}_timeseries.nc"
 
 _spec = importlib.util.spec_from_file_location(
     "plot_event_timeseries", TC_TRACKS_PROD_DIR / "plot_event_timeseries.py"
@@ -73,8 +76,8 @@ def compute_series() -> xr.Dataset:
     return xr.Dataset(data_vars, coords={"time": times})
 
 
-def load_series() -> xr.Dataset:
-    if CACHE_PATH.exists():
+def load_series(refresh: bool = False) -> xr.Dataset:
+    if CACHE_PATH.exists() and not refresh:
         print(f"Loading cached series: {CACHE_PATH}")
         return xr.open_dataset(CACHE_PATH).load()
     series = compute_series()
@@ -124,7 +127,10 @@ def plot(series: xr.Dataset) -> None:
 
 
 def main():
-    plot(load_series())
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--refresh", action="store_true", help="Recompute the cached series and overwrite CACHE_PATH.")
+    args = parser.parse_args()
+    plot(load_series(refresh=args.refresh))
 
 
 if __name__ == "__main__":

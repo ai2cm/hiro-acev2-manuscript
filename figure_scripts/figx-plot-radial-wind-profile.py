@@ -52,9 +52,18 @@ reimplemented them locally; see that module's docstring for what else uses
 each piece). The ensemble-independent-sample composite/scatter logic and the
 density-contour plotting below are unique to this script and stay local.
 
+Each series' composite histogram and scatter points (all either panel draws
+for it) are cached under ``plot_data_cache/figx-plot-radial-wind-profile/``
+(see ``plot_cache.py``), one file per series, keyed by --year and
+--max-radius-deg; later runs draw both figures from the cache without opening
+any snapshot. Pass ``--refresh`` to recompute (also needed after pointing
+--perfect-pred-dir/--hiro-ace-dir somewhere else, which the cache names don't
+track).
+
 Usage:
     python figx-plot-radial-wind-profile.py
     python figx-plot-radial-wind-profile.py --out-dir main_figures
+    python figx-plot-radial-wind-profile.py --refresh
 """
 
 import argparse
@@ -71,6 +80,7 @@ import xarray as xr  # noqa: E402
 from matplotlib.ticker import NullFormatter, ScalarFormatter  # noqa: E402
 from scipy.stats import gaussian_kde  # noqa: E402
 
+from plot_cache import MAIN_FIGURES_DIR, cached_arrays  # noqa: E402
 from series_colors import HIRO_ACE_COLOR, PERFECT_PRED_COLOR, REFERENCE_COLOR  # noqa: E402
 from tc_snapshot_common import (  # noqa: E402
     _azimuthal_mean,
@@ -106,7 +116,8 @@ DEFAULT_HIRO_ACE_DIR = (
     "2026-08-19-hiro-ace2s-rollout-all-tcs-max-snapshot"
 )
 DEFAULT_YEAR = 2023
-DEFAULT_OUT_DIR = "main_figures"
+DEFAULT_OUT_DIR = MAIN_FIGURES_DIR
+CACHE_SUBDIR = Path(__file__).stem
 PERFECT_PRED_FILENAME = "radial_wind_profile_perfect_pred.png"
 HIRO_ACE_FILENAME = "radial_wind_profile_hiro_ace.png"
 
@@ -313,6 +324,34 @@ def target_composite_and_scatter(name: str, paths: list, max_radius_deg: float, 
 
 
 # --------------------------------------------------------------------------- #
+# Plot-data cache: one npz per series holding its composite entry's grids/counts
+# and its scatter entry's points, so both panels can be drawn without the
+# snapshot directories.
+# --------------------------------------------------------------------------- #
+def load_series(cache_key: str, max_radius_deg: float, compute, refresh: bool) -> tuple:
+    """``(composite_entry, scatter_entry)`` for one series, as returned by
+    ``compute()`` (one of the ``*_composite_and_scatter`` functions above), from
+    ``plot_data_cache/<CACHE_SUBDIR>/<cache_key>_r<max_radius_deg>.npz`` if present."""
+
+    def compute_arrays() -> dict:
+        (name, sum_grid, count_grid, n_snapshots, n_samples), (_, rmw, peak) = compute()
+        return {
+            "name": np.array(name), "sum_grid": sum_grid, "count_grid": count_grid,
+            "n_snapshots": np.array(n_snapshots), "n_samples": np.array(n_samples),
+            "rmw": rmw, "peak": peak,
+        }
+
+    arrays = cached_arrays(f"{CACHE_SUBDIR}/{cache_key}_r{max_radius_deg:g}.npz", compute_arrays, refresh)
+    name = str(arrays["name"])
+    composite_entry = (
+        name, arrays["sum_grid"], arrays["count_grid"],
+        int(arrays["n_snapshots"]), int(arrays["n_samples"]),
+    )
+    scatter_entry = (name, arrays["rmw"], arrays["peak"])
+    return composite_entry, scatter_entry
+
+
+# --------------------------------------------------------------------------- #
 # Plotting
 # --------------------------------------------------------------------------- #
 def _plot_composite_panel(ax, results: list, r_centers: np.ndarray) -> None:
@@ -490,28 +529,50 @@ def main() -> None:
         default=16,
         help="Worker processes for reading/binning snapshots in parallel (default: 16).",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Recompute every series' plot data and overwrite its plot_data_cache/ file.",
+    )
     args = parser.parse_args()
 
+    # File discovery only runs when some series' cache is missing (or --refresh).
     perfect_pred_dir = Path(args.perfect_pred_dir)
-    all_perfect_pred_files = find_track_files(perfect_pred_dir)
-    perfect_pred_2023_files = (
-        filter_by_year(all_perfect_pred_files, args.year) if args.year else all_perfect_pred_files
-    )
-    perfect_pred_2023_paths = list(perfect_pred_2023_files.values())
-    all_perfect_pred_paths = list(all_perfect_pred_files.values())
+
+    def all_perfect_pred_paths() -> list:
+        return list(find_track_files(perfect_pred_dir).values())
+
+    def perfect_pred_2023_paths() -> list:
+        all_perfect_pred_files = find_track_files(perfect_pred_dir)
+        perfect_pred_2023_files = (
+            filter_by_year(all_perfect_pred_files, args.year) if args.year else all_perfect_pred_files
+        )
+        return list(perfect_pred_2023_files.values())
 
     hiro_ace_dir = Path(args.hiro_ace_dir)
-    hiro_ace_paths = list(find_track_files(hiro_ace_dir).values())
-    logger.info("%s: %d track(s)", hiro_ace_dir, len(hiro_ace_paths))
+
+    def hiro_ace_paths() -> list:
+        paths = list(find_track_files(hiro_ace_dir).values())
+        logger.info("%s: %d track(s)", hiro_ace_dir, len(paths))
+        return paths
 
     out_dir = Path(args.out_dir)
+    year_key = args.year or "all"
 
     # Figure 1: 2023 holdout, perfect prediction vs. its colocated X-SHiELD reference.
-    pp_2023_composite, pp_2023_scatter = predicted_composite_and_scatter(
-        PERFECT_PRED_LABEL, perfect_pred_2023_paths, args.max_radius_deg, args.max_workers
+    pp_2023_composite, pp_2023_scatter = load_series(
+        f"perfect_pred_{year_key}", args.max_radius_deg,
+        lambda: predicted_composite_and_scatter(
+            PERFECT_PRED_LABEL, perfect_pred_2023_paths(), args.max_radius_deg, args.max_workers
+        ),
+        args.refresh,
     )
-    ref_2023_composite, ref_2023_scatter = target_composite_and_scatter(
-        REFERENCE_LABEL, perfect_pred_2023_paths, args.max_radius_deg, args.max_workers
+    ref_2023_composite, ref_2023_scatter = load_series(
+        f"reference_{year_key}", args.max_radius_deg,
+        lambda: target_composite_and_scatter(
+            REFERENCE_LABEL, perfect_pred_2023_paths(), args.max_radius_deg, args.max_workers
+        ),
+        args.refresh,
     )
     plot_comparison(
         [pp_2023_composite, ref_2023_composite],
@@ -523,11 +584,19 @@ def main() -> None:
     # Figure 2: full set, the same directory's X-SHiELD reference (unrestricted by
     # year) vs. HiRO-ACE's own free-running rollout tracks -- an independent,
     # unmatched population (see the module docstring).
-    ref_full_composite, ref_full_scatter = target_composite_and_scatter(
-        REFERENCE_LABEL, all_perfect_pred_paths, args.max_radius_deg, args.max_workers
+    ref_full_composite, ref_full_scatter = load_series(
+        "reference_all", args.max_radius_deg,
+        lambda: target_composite_and_scatter(
+            REFERENCE_LABEL, all_perfect_pred_paths(), args.max_radius_deg, args.max_workers
+        ),
+        args.refresh,
     )
-    ace_composite, ace_scatter = predicted_composite_and_scatter(
-        HIRO_ACE_LABEL, hiro_ace_paths, args.max_radius_deg, args.max_workers
+    ace_composite, ace_scatter = load_series(
+        "hiro_ace_all", args.max_radius_deg,
+        lambda: predicted_composite_and_scatter(
+            HIRO_ACE_LABEL, hiro_ace_paths(), args.max_radius_deg, args.max_workers
+        ),
+        args.refresh,
     )
     plot_comparison(
         [ref_full_composite, ace_composite],

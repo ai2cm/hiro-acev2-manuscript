@@ -1,3 +1,15 @@
+"""HiRO-ACEv2 North Atlantic hurricane snapshot, 2021-09-18T18:00:
+main_figures/HiRO-ACE-hurricane-example.png (sample 0) and
+supplements/HiRO-ACE-hurricane-example-ensemble.png (every sample).
+
+The plot data -- the four fields cropped to each figure's own field of view:
+sample 0 for the main figure, every sample for the ensemble supplement's
+narrower box -- is cached in plot_data_cache/figx-hiro-ace-event-snapshot-tc/;
+pass --refresh to recompute it from the downscaled track file.
+"""
+
+import argparse
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
@@ -5,11 +17,17 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 import xarray as xr
 
+from plot_cache import MAIN_FIGURES_DIR, SUPPLEMENTS_DIR, cached_dataset
 from precip_scale import OCEAN_COLOR, TC_TOP_PERCENTILE, dry_masked, precip_norm
 
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--refresh", action="store_true", help="recompute the cached plot data"
+)
+args = parser.parse_args()
+
 root = "/climate-default/2026-08-03-hiro-ace-v2-outputs/2026-07-16-ace2s-shieldplus-tuned-xshield-downscaled-tc-tracks-10yr"
-ds=xr.open_dataset(f"{root}/north_atlantic_000_20210918T18.nc")
-sample0 = ds.isel(sample=0)
+CACHE_SUBDIR = "figx-hiro-ace-event-snapshot-tc"
 
 TIMESTAMP = "2021-09-18 18:00 UTC"
 # Half-width of the field of view, about the domain centre. The ensemble
@@ -17,8 +35,35 @@ TIMESTAMP = "2021-09-18 18:00 UTC"
 # width, so it does not carry the extra degrees as usefully.
 HALF_WIDTH_DEG = 3.0
 
-lat_center = float((ds.lat.min() + ds.lat.max()) / 2)
-lon_center = float((ds.lon.min() + ds.lon.max()) / 2)
+
+def compute_crop(half_width_deg, samples=None):
+    """The track file cropped to ``half_width_deg`` about the domain centre,
+    for ``samples`` (all if None).
+
+    The centre is the *full* domain's, so it rides along as attributes.
+    """
+    full = xr.open_dataset(f"{root}/north_atlantic_000_20210918T18.nc")
+    lat_center = float((full.lat.min() + full.lat.max()) / 2)
+    lon_center = float((full.lon.min() + full.lon.max()) / 2)
+    if samples is not None:
+        full = full.isel(sample=samples)
+    crop = full.sel(
+        lat=slice(lat_center - half_width_deg, lat_center + half_width_deg),
+        lon=slice(lon_center - half_width_deg, lon_center + half_width_deg),
+    ).load()
+    crop.attrs.update(lat_center=lat_center, lon_center=lon_center)
+    return crop
+
+
+ds = cached_dataset(
+    f"{CACHE_SUBDIR}/sample0_crop.nc",
+    lambda: compute_crop(HALF_WIDTH_DEG, samples=[0]),
+    args.refresh,
+)
+sample0 = ds.isel(sample=0)
+
+lat_center = float(ds.attrs["lat_center"])
+lon_center = float(ds.attrs["lon_center"])
 sample0 = sample0.sel(
     lat=slice(lat_center - HALF_WIDTH_DEG, lat_center + HALF_WIDTH_DEG),
     lon=slice(lon_center - HALF_WIDTH_DEG, lon_center + HALF_WIDTH_DEG),
@@ -122,7 +167,8 @@ titles_top = max(
     for ax in axes
 )
 fig.suptitle(TIMESTAMP, fontsize=16, y=titles_top + 0.03, va="bottom")
-plt.savefig('main_figures/HiRO-ACE-hurricane-example.png', dpi=400,
+MAIN_FIGURES_DIR.mkdir(exist_ok=True)
+plt.savefig(MAIN_FIGURES_DIR / 'HiRO-ACE-hurricane-example.png', dpi=400,
             transparent=True, bbox_inches='tight')
 plt.show()
 
@@ -134,6 +180,11 @@ plt.show()
 # ---------------------------------------------------------------------------
 
 ENS_HALF_WIDTH_DEG = 2.0
+ds = cached_dataset(
+    f"{CACHE_SUBDIR}/ensemble_crop.nc",
+    lambda: compute_crop(ENS_HALF_WIDTH_DEG),
+    args.refresh,
+)
 ens = ds.sel(
     lat=slice(lat_center - ENS_HALF_WIDTH_DEG, lat_center + ENS_HALF_WIDTH_DEG),
     lon=slice(lon_center - ENS_HALF_WIDTH_DEG, lon_center + ENS_HALF_WIDTH_DEG),
@@ -232,8 +283,9 @@ fig_e.suptitle(
     "HiRO-ACEv2 North Atlantic hurricane 2021-09-18T18:00 -- all generated samples",
     fontsize=14,
 )
+SUPPLEMENTS_DIR.mkdir(exist_ok=True)
 fig_e.savefig(
-    'supplements/HiRO-ACE-hurricane-example-ensemble.png',
+    SUPPLEMENTS_DIR / 'HiRO-ACE-hurricane-example-ensemble.png',
     dpi=300,
     transparent=True,
     bbox_inches="tight",

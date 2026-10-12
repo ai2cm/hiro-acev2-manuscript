@@ -1,3 +1,17 @@
+"""Perfect-prediction snapshot of the Philippine TC (track 743, 2023-10-27T00):
+main_figures/perfect_pred_Phl_tc.png, supplements/perfect_pred_Phl_tc_ensemble.png
+and supplements/perfect_pred_Phl_tc_press_contours.png.
+
+The plot data -- the 6-degree crop the first two figures draw (bicubic, target
+and every predicted sample) and the 2-degree box about the target pressure
+minimum the third draws -- is cached in
+plot_data_cache/figx-perfect-pred-event-snapshot-Phl-tc/; pass --refresh to
+recompute it from the snapshot file and the 100km coarse stores.
+"""
+
+import argparse
+from functools import lru_cache
+
 import xarray as xr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -18,6 +32,13 @@ from precip_scale import (
 )
 from series_colors import PERFECT_PRED_COLOR
 from bicubic_interp import bicubic_to_grid
+from plot_cache import MAIN_FIGURES_DIR, SUPPLEMENTS_DIR, cached_dataset
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--refresh", action="store_true", help="recompute the cached plot data"
+)
+args = parser.parse_args()
 
 # Phl tc
 FILENAME='tc_743_20231027T00.nc'
@@ -186,7 +207,7 @@ def open_stores(paths: list[str]) -> list[xr.Dataset]:
     return stores
 
 root="/climate-default/2026-08-03-hiro-ace-v2-outputs/2026-08-10-hiro-perfect-pred-all-tcs-max-snapshot"
-ds=xr.open_dataset(f"{root}/{FILENAME}")
+CACHE_SUBDIR = "figx-perfect-pred-event-snapshot-Phl-tc"
 
 # This run downscales the 100km stores to 3km (see config.yaml's data.coarse),
 # so those are the coarse input fields; the .nc file already carries the
@@ -197,32 +218,54 @@ COARSE_ZARRS = [
 ]
 
 event_time = pd.to_datetime("20231027T00", format="%Y%m%dT%H")
-coarse_stores = open_stores(COARSE_ZARRS)
 
-for var in ["PRATEsfc", "PRMSL", "eastward_wind_at_ten_meters", "northward_wind_at_ten_meters"]:
-    store, store_var = _find_in_stores(coarse_stores, var)
-    ds[f"{var}_coarse"] = select_on_event_grid(store, store_var, event_time, ds)
-    ds[f"{var}_bicubic"] = bicubic_on_event_grid(store, store_var, event_time, ds)
 
-ds = add_wind_speed(ds)
-# The left column of the main figure and of the ensemble supplement is the
-# bicubic baseline, with wind speed derived from the interpolated components
-# rather than interpolated itself.
-ds["wind_speed_bicubic"] = np.sqrt(
-    ds.eastward_wind_at_ten_meters_bicubic**2
-    + ds.northward_wind_at_ten_meters_bicubic**2
-)
+@lru_cache(maxsize=1)
+def load_event() -> xr.Dataset:
+    """The full event box with the coarse/bicubic fields and wind speeds added;
+    shared by both cache computes, so the coarse stores are read once."""
+    ds=xr.open_dataset(f"{root}/{FILENAME}")
+    coarse_stores = open_stores(COARSE_ZARRS)
+
+    for var in ["PRATEsfc", "PRMSL", "eastward_wind_at_ten_meters", "northward_wind_at_ten_meters"]:
+        store, store_var = _find_in_stores(coarse_stores, var)
+        ds[f"{var}_coarse"] = select_on_event_grid(store, store_var, event_time, ds)
+        ds[f"{var}_bicubic"] = bicubic_on_event_grid(store, store_var, event_time, ds)
+
+    ds = add_wind_speed(ds)
+    # The left column of the main figure and of the ensemble supplement is the
+    # bicubic baseline, with wind speed derived from the interpolated components
+    # rather than interpolated itself.
+    ds["wind_speed_bicubic"] = np.sqrt(
+        ds.eastward_wind_at_ten_meters_bicubic**2
+        + ds.northward_wind_at_ten_meters_bicubic**2
+    )
+    return ds
 
 
 CROP_DEG = 6.0
-center_lat = float(ds.lat.mean())
-center_lon = float(ds.lon.mean())
-ds_crop = ds.sel(
-    lat=slice(center_lat - CROP_DEG / 2, center_lat + CROP_DEG / 2),
-    lon=slice(center_lon - CROP_DEG / 2, center_lon + CROP_DEG / 2),
-)
-for suffix in ["coarse", "bicubic", "target", "predicted"]:
-    ds_crop[f"PRATEsfc_{suffix}"] = ds_crop[f"PRATEsfc_{suffix}"] * 86400  # kg/m^2/s -> mm/day
+# The fields drawn from the crop: ROWS' variables, for each of COL_LABELS.
+CROP_VARS = [
+    f"{var}_{suffix}"
+    for var in ["PRATEsfc", "PRMSL", "wind_speed"]
+    for suffix in ["bicubic", "target", "predicted"]
+]
+
+
+def compute_crop() -> xr.Dataset:
+    ds = load_event()
+    center_lat = float(ds.lat.mean())
+    center_lon = float(ds.lon.mean())
+    ds_crop = ds.sel(
+        lat=slice(center_lat - CROP_DEG / 2, center_lat + CROP_DEG / 2),
+        lon=slice(center_lon - CROP_DEG / 2, center_lon + CROP_DEG / 2),
+    )
+    for suffix in ["coarse", "bicubic", "target", "predicted"]:
+        ds_crop[f"PRATEsfc_{suffix}"] = ds_crop[f"PRATEsfc_{suffix}"] * 86400  # kg/m^2/s -> mm/day
+    return ds_crop[CROP_VARS].load()
+
+
+ds_crop = cached_dataset(f"{CACHE_SUBDIR}/crop.nc", compute_crop, args.refresh)
 
 # All three fields are physically non-negative, so turbo (with vmin clipped to
 # 0) suits them all -- unlike plot_events.plot_event's auto RdBu_r/turbo
@@ -409,7 +452,8 @@ for row, (var, title, units) in enumerate(ROWS):
         hist_ax.set_ylim(y_lo, y_hi * 10 ** LEGEND_HEADROOM_DECADES)
         hist_ax.legend(fontsize=6, loc="upper right")
 
-plt.savefig('main_figures/perfect_pred_Phl_tc.png', dpi=300, transparent=True, bbox_inches="tight")
+MAIN_FIGURES_DIR.mkdir(exist_ok=True)
+plt.savefig(MAIN_FIGURES_DIR / 'perfect_pred_Phl_tc.png', dpi=300, transparent=True, bbox_inches="tight")
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +529,9 @@ for row, (var, title, units) in enumerate(ROWS):
         rotation=90,
     )
 
+SUPPLEMENTS_DIR.mkdir(exist_ok=True)
 plt.savefig(
-    'supplements/perfect_pred_Phl_tc_ensemble.png', dpi=300, transparent=True, bbox_inches="tight"
+    SUPPLEMENTS_DIR / 'perfect_pred_Phl_tc_ensemble.png', dpi=300, transparent=True, bbox_inches="tight"
 )
 
 
@@ -527,12 +572,28 @@ def _contour_levels(fields: list[xr.DataArray]) -> np.ndarray:
     return levels
 
 
-# The centre comes from the full event box, before any cropping.
-zoom_lat, zoom_lon, zoom_min = _pressure_min(ds.PRMSL_target)
-_half = ZOOM_DEG / 2
-ds_zoom = ds.sel(
-    lat=slice(zoom_lat - _half, zoom_lat + _half),
-    lon=slice(zoom_lon - _half, zoom_lon + _half),
+def compute_zoom() -> xr.Dataset:
+    ds = load_event()
+    # The centre comes from the full event box, before any cropping, so it
+    # rides along as attributes.
+    zoom_lat, zoom_lon, zoom_min = _pressure_min(ds.PRMSL_target)
+    _half = ZOOM_DEG / 2
+    ds_zoom = ds.sel(
+        lat=slice(zoom_lat - _half, zoom_lat + _half),
+        lon=slice(zoom_lon - _half, zoom_lon + _half),
+    )
+    # Only the sample drawn; it keeps its "sample" label, which the panels
+    # below select by.
+    ds_zoom = ds_zoom[
+        ["wind_speed_target", "PRMSL_target", "wind_speed_predicted", "PRMSL_predicted"]
+    ].sel(sample=[ZOOM_SAMPLE]).load()
+    ds_zoom.attrs.update(zoom_lat=zoom_lat, zoom_lon=zoom_lon, zoom_min=zoom_min)
+    return ds_zoom
+
+
+ds_zoom = cached_dataset(f"{CACHE_SUBDIR}/zoom.nc", compute_zoom, args.refresh)
+zoom_lat, zoom_lon, zoom_min = (
+    ds_zoom.attrs[k] for k in ("zoom_lat", "zoom_lon", "zoom_min")
 )
 print(
     f"target pressure minimum {zoom_min:.1f} hPa at {zoom_lat:.2f} N, "
@@ -544,8 +605,8 @@ zoom_panels = [
     ("Target", ds_zoom.wind_speed_target, ds_zoom.PRMSL_target),
     (
         "Predicted",
-        ds_zoom.wind_speed_predicted.isel(sample=ZOOM_SAMPLE),
-        ds_zoom.PRMSL_predicted.isel(sample=ZOOM_SAMPLE),
+        ds_zoom.wind_speed_predicted.sel(sample=ZOOM_SAMPLE),
+        ds_zoom.PRMSL_predicted.sel(sample=ZOOM_SAMPLE),
     ),
 ]
 
@@ -594,7 +655,7 @@ cbar_z = fig_z.colorbar(img, cax=cax_z)
 cbar_z.set_label("m/s", labelpad=2)
 
 plt.savefig(
-    'supplements/perfect_pred_Phl_tc_press_contours.png',
+    SUPPLEMENTS_DIR / 'perfect_pred_Phl_tc_press_contours.png',
     dpi=300,
     transparent=True,
     bbox_inches="tight",

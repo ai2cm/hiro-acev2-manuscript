@@ -35,8 +35,22 @@ shows through. The two wind events are each cropped to the edges of a 2x3 block
 of whole coarse cells, the same construction as
 ``figx-downslope-wind-events.py``'s corridor box, so the coarse panel shows
 complete cells rather than cells clipped by the frame.
+
+The figures are picked by key on the command line, all five by default::
+
+    python figx-hiro-ace-event-snapshots.py                 # all five
+    python figx-hiro-ace-event-snapshots.py ar2             # main_figures/hiro_ace_ar2_2023-01-31_precip.png
+    python figx-hiro-ace-event-snapshots.py ar1 ar2_slp     # the two supplements
+
+The plot data -- each event's 3 km fields cropped to its panel, and for the
+wind events the field-of-view box and the topography under it -- is cached in
+plot_data_cache/figx-hiro-ace-event-snapshots/, one file per event (ar2 and
+ar2_slp share theirs); pass --refresh to recompute the selected figures' from
+the stores. The wind events' land mask still comes from cartopy's Natural Earth
+polygons, as do the coastlines drawn.
 """
 
+import argparse
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -59,6 +73,7 @@ from cartopy.mpl.gridliner import LATITUDE_FORMATTER, LONGITUDE_FORMATTER
 from scipy import ndimage
 from shapely.ops import unary_union
 
+from plot_cache import MAIN_FIGURES_DIR, SUPPLEMENTS_DIR, cached_dataset
 from precip_scale import (
     LAND_COLOR,
     OCEAN_COLOR,
@@ -73,8 +88,9 @@ HERE = Path(__file__).parent
 # Every figure here is named for the model, whichever directory it lands in;
 # the keys are the catalogue's, which say nothing about where they came from.
 PREFIX = "hiro_ace_"
-MAIN_FIGURES = HERE / "main_figures"
-SUPPLEMENTS = HERE / "supplements"
+MAIN_FIGURES = MAIN_FIGURES_DIR
+SUPPLEMENTS = SUPPLEMENTS_DIR
+CACHE_SUBDIR = "figx-hiro-ace-event-snapshots"
 DESTINATIONS = {
     "ar1": SUPPLEMENTS,
     "ar2": MAIN_FIGURES,
@@ -286,6 +302,25 @@ def load_panel(path, stamp, extent, fine):
     return sub.load()
 
 
+# The 3 km variables each event's figures draw; ar2's file also serves ar2_slp.
+FINE_VARS = {
+    "ar1": ["PRATEsfc"],
+    "ar2": ["PRATEsfc", "UGRD10m", "VGRD10m", "PRMSL"],
+}
+
+
+def load_fine_panel(key, stamp, extent, refresh=False):
+    """``load_panel`` on the 3 km store, through the plot-data cache, keeping
+    only ``FINE_VARS[key]``. The file is named for the event, not the extent,
+    so --refresh after changing an event's extent."""
+    name = f"{CACHE_SUBDIR}/{key}_{stamp[:10]}T{stamp[11:]}_fine.nc"
+    return cached_dataset(
+        name,
+        lambda: load_panel(FINE, stamp, extent, True)[FINE_VARS[key]],
+        refresh,
+    )
+
+
 def draw_precip_panel(ax, sub, extent, clon, norm, cmap):
     x0, x1, y0, y1 = extent
     ax.set_extent(
@@ -310,7 +345,7 @@ def draw_precip_panel(ax, sub, extent, clon, norm, cmap):
     return mesh
 
 
-def build_precip(key, stamp, extent):
+def build_precip(key, stamp, extent, refresh=False):
     x0, x1, y0, y1 = extent
     y1 = min(y1, FINE_LAT_MAX)
     extent = (x0, x1, y0, y1)
@@ -318,7 +353,7 @@ def build_precip(key, stamp, extent):
     proj = ccrs.PlateCarree(central_longitude=clon)
 
     # The scale is this event's own, now set from the one panel that is drawn.
-    sub = load_panel(FINE, stamp, extent, True)
+    sub = load_fine_panel(key, stamp, extent, refresh)
     rate = (sub.PRATEsfc * 86400).values
     norm, cmap, levels = precip_norm(rate, rate)
 
@@ -368,7 +403,7 @@ def draw_slp_panel(ax, sub, extent, clon, norm, levels, smooth_cells,
     return mesh
 
 
-def build_slp(key, stamp, extent, out_dir):
+def build_slp(key, stamp, extent, out_dir, refresh=False):
     """The precip figure's twin: same event and extent, shading sea-level
     pressure instead."""
     x0, x1, y0, y1 = extent
@@ -377,7 +412,7 @@ def build_slp(key, stamp, extent, out_dir):
     clon = 0.5 * (x0 + x1)
     proj = ccrs.PlateCarree(central_longitude=clon)
 
-    sub = load_panel(FINE, stamp, extent, True)
+    sub = load_fine_panel(key, stamp, extent, refresh)
     pressure = sub.PRMSL.values
     norm = Normalize(vmin=np.floor(pressure.min()), vmax=np.ceil(pressure.max()))
     levels = isobar_levels(pressure)
@@ -446,7 +481,7 @@ def draw_wind_speed_panel(ax, sub, extent, clon, norm):
     return mesh
 
 
-def build_ar_panels(key, stamp, extent, field="precip"):
+def build_ar_panels(key, stamp, extent, field="precip", refresh=False):
     """The precip panel with the 10 m wind speed and the sea-level pressure
     beside it: same event, extent and timestep, one field per column."""
     x0, x1, y0, y1 = extent
@@ -455,7 +490,7 @@ def build_ar_panels(key, stamp, extent, field="precip"):
     clon = 0.5 * (x0 + x1)
     proj = ccrs.PlateCarree(central_longitude=clon)
 
-    sub = load_panel(FINE, stamp, extent, True)
+    sub = load_fine_panel(key, stamp, extent, refresh)
     rate = (sub.PRATEsfc * 86400).values
     norm, cmap, levels = precip_norm(rate, rate)
     # The same saturating percentile as the precip scale, so a few extreme
@@ -682,11 +717,29 @@ def load_wind_panel(path, stamp, box, fine, pad=0.0):
     return to_signed(sub)
 
 
-def build_wind(key, stamp, center, cities):
+def compute_wind_panel(stamp, center):
+    """The 3 km wind panel, carrying its coarse-cell box as an attribute (the
+    box needs the coarse store's grid, which the cache spares a read of)."""
     box = six_coarse_cell_box(*center)
+    # The speed is rederived on load, so only the components are kept.
+    fine = load_wind_panel(FINE, stamp, box, True, pad=0.1).drop_vars("wind_speed")
+    fine.attrs["box"] = np.array(box)
+    return fine
+
+
+def build_wind(key, stamp, center, cities, refresh=False):
+    tag = f"{CACHE_SUBDIR}/{key}_{stamp[:10]}T{stamp[11:]}"
+    fine = cached_dataset(
+        f"{tag}_wind.nc", lambda: compute_wind_panel(stamp, center), refresh
+    )
+    fine["wind_speed"] = np.hypot(fine.UGRD10m, fine.VGRD10m)
+    box = tuple(float(v) for v in fine.attrs["box"])
     lat0, lat1, lon0, lon1 = box
-    fine = load_wind_panel(FINE, stamp, box, True, pad=0.1)
-    topo = load_topography(lat0 - 0.2, lat1 + 0.2, lon0 - 0.2, lon1 + 0.2)
+    topo = cached_dataset(
+        f"{tag}_topo.nc",
+        lambda: load_topography(lat0 - 0.2, lat1 + 0.2, lon0 - 0.2, lon1 + 0.2).to_dataset(),
+        refresh,
+    ).HGTsfc
     vmax = float(fine.sel(lat=slice(lat0, lat1)).wind_speed.max())
     lo0, lo1 = ((lon0 + 180) % 360) - 180, ((lon1 + 180) % 360) - 180
     inbox = fine.sel(lat=slice(lat0, lat1), lon=slice(lo0, lo1))
@@ -771,26 +824,31 @@ LA = {"Los Angeles": (34.05, -118.24)}
 RIJEKA = {"Rijeka": (45.33, 14.44)}
 
 FIGURES = {
-    "ar1": lambda: build_precip("ar1", "2023-01-27 18", AR1_EXTENT),
+    "ar1": lambda refresh: build_precip("ar1", "2023-01-27 18", AR1_EXTENT, refresh=refresh),
     # Three columns: precip, 10 m wind speed, sea-level pressure.
-    "ar2": lambda: build_ar_panels("ar2", "2023-01-31 00", AR2_EXTENT),
+    "ar2": lambda refresh: build_ar_panels("ar2", "2023-01-31 00", AR2_EXTENT, refresh=refresh),
     # ar2's pressure twin, a supplement to the precip figure in main_figures.
-    "ar2_slp": lambda: build_slp("ar2", "2023-01-31 00", AR2_EXTENT, SUPPLEMENTS),
-    "sa1": lambda: build_wind("sa1", "2023-02-22 18", SA_CENTER, LA),
-    "bora1": lambda: build_wind("bora1", "2023-01-29 06", BORA_CENTER, RIJEKA),
+    "ar2_slp": lambda refresh: build_slp("ar2", "2023-01-31 00", AR2_EXTENT, SUPPLEMENTS, refresh=refresh),
+    "sa1": lambda refresh: build_wind("sa1", "2023-02-22 18", SA_CENTER, LA, refresh=refresh),
+    "bora1": lambda refresh: build_wind("bora1", "2023-01-29 06", BORA_CENTER, RIJEKA, refresh=refresh),
 }
 
 
 def main():
-    import sys
+    parser = argparse.ArgumentParser()
+    parser.add_argument("figures", nargs="*", help=f"figure keys, of {sorted(FIGURES)}; default all")
+    parser.add_argument(
+        "--refresh", action="store_true", help="recompute the cached plot data"
+    )
+    args = parser.parse_args()
 
-    only = set(sys.argv[1:]) or set(FIGURES)
+    only = set(args.figures) or set(FIGURES)
     unknown = only - set(FIGURES)
     if unknown:
         raise SystemExit(f"unknown figure(s) {sorted(unknown)}; have {sorted(FIGURES)}")
     for key in FIGURES:
         if key in only:
-            FIGURES[key]()
+            FIGURES[key](args.refresh)
 
 
 if __name__ == "__main__":

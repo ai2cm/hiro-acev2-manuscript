@@ -63,8 +63,15 @@ these thresholds are the ones whose near-zero target IKE makes relative bias
 noisy, so seeing progressively more intense subsets shows whether the
 model's bias on genuine storms differs from its bias on marginal ones.
 
+The per-track/per-sample arrays from ``collect_bias`` (everything both
+figures and the printed table need) are cached under
+``plot_data_cache/figx-windspeed-ike-perfect-pred-tc-bias/`` (see
+``plot_cache.py``), keyed by year and IKE spec; later runs draw from the cache
+without opening any snapshot. Pass ``--refresh`` to recompute.
+
 Usage:
     python figx-windspeed-ike-perfect-pred-tc-bias.py
+    python figx-windspeed-ike-perfect-pred-tc-bias.py --refresh
 """
 
 import argparse
@@ -77,6 +84,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
+from plot_cache import MAIN_FIGURES_DIR, SUPPLEMENTS_DIR, cached_arrays
 from series_colors import PERFECT_PRED_COLOR, REFERENCE_COLOR
 from tc_snapshot_common import (
     _coord_names,
@@ -96,8 +104,9 @@ DEFAULT_ROOT = (
 # Two figures out of the same computation: the IKE predicted-vs-target panel
 # alone for the paper, and all three panels (that same IKE panel first) for
 # the supplement.
-DEFAULT_OUT = "main_figures/perfect_pred_wind_ike_bias_scatter.png"
-DEFAULT_SUPPLEMENTAL_OUT = "supplements/perfect_pred_ike_vs_wind_scatter.png"
+DEFAULT_OUT = MAIN_FIGURES_DIR / "perfect_pred_wind_ike_bias_scatter.png"
+DEFAULT_SUPPLEMENTAL_OUT = SUPPLEMENTS_DIR / "perfect_pred_ike_vs_wind_scatter.png"
+CACHE_SUBDIR = Path(__file__).stem
 PANEL_LABELS = ("a)", "b)")
 PANEL_LABEL_FONTSIZE = 12
 DEFAULT_MAX_WORKERS = 16
@@ -296,6 +305,27 @@ def collect_bias(directory: Path, ike: IkeSpec, max_workers: int, year: int | No
         "track_n_samples": np.array(track_n_samples),
         "n_tracks": n_tracks,
     }
+
+
+def _cache_name(ike: IkeSpec, year: int | None) -> str:
+    """Plot-data cache file for one (year, IKE spec) -- the only inputs besides
+    --root that change ``collect_bias``'s output."""
+    return (
+        f"{CACHE_SUBDIR}/bias_{year or 'all'}_ike-box{ike.box_deg:g}"
+        f"-min{ike.min_wind if ike.min_wind is not None else 'none'}"
+        f"-max{ike.max_wind if ike.max_wind is not None else 'none'}.npz"
+    )
+
+
+def load_bias(directory: Path, ike: IkeSpec, max_workers: int, year: int | None, refresh: bool) -> dict:
+    """``collect_bias``'s arrays, from the plot-data cache if present."""
+    data = cached_arrays(
+        _cache_name(ike, year),
+        lambda: collect_bias(directory, ike, max_workers, year=year),
+        refresh,
+    )
+    data["n_tracks"] = int(data["n_tracks"])
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -536,6 +566,10 @@ def main() -> None:
         "--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
         help=f"Worker processes for reading/reducing tracks in parallel (default: {DEFAULT_MAX_WORKERS}).",
     )
+    parser.add_argument(
+        "--refresh", action="store_true",
+        help="Recompute the per-track plot data and overwrite its plot_data_cache/ file.",
+    )
     args = parser.parse_args()
 
     ike = IkeSpec(
@@ -544,7 +578,7 @@ def main() -> None:
         max_wind=args.ike_max_wind,
     )
 
-    data = collect_bias(Path(args.root), ike, args.max_workers, year=YEAR)
+    data = load_bias(Path(args.root), ike, args.max_workers, YEAR, args.refresh)
     make_main_figure(data, Path(args.out))
     make_supplemental_figure(data, Path(args.supplemental_out))
     print_bias_summary(data)

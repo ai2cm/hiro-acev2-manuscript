@@ -65,6 +65,12 @@ already tight (see ``sharey=False`` in ``plot_histogram_by_basin``), so a log
 scale would add little while making the dominant low-wind bin harder to read
 at a glance.
 
+Each series' per-track peaks (wind and IKE per sample, plus the track's basin)
+are cached in
+``plot_data_cache/figx-max-wind-ike-histograms/<run dir>_<predicted|target>_<IKE spec>.npz``,
+keyed on the run directory and the IKE options, so the figures redraw without
+opening the snapshot files. Pass --refresh to recompute them.
+
 Usage:
     python plot_max_wind_ike_histograms.py
     python plot_max_wind_ike_histograms.py --out max_wind_histogram.png --ike-out ike_histogram.png
@@ -86,6 +92,7 @@ import numpy as np  # noqa: E402
 import xarray as xr  # noqa: E402
 from matplotlib.colors import to_rgba  # noqa: E402
 
+from plot_cache import MAIN_FIGURES_DIR, SUPPLEMENTS_DIR, cached_arrays  # noqa: E402
 from series_colors import HIRO_ACE_COLOR, PERFECT_PRED_COLOR, REFERENCE_COLOR  # noqa: E402
 from tc_snapshot_common import (  # noqa: E402
     _coord_names,
@@ -105,10 +112,11 @@ DEFAULT_HIRO_ACE_DIR = (
     "/climate-default/2026-08-03-hiro-ace-v2-outputs/"
     "2026-08-19-hiro-ace2s-rollout-all-tcs-max-snapshot"
 )
-DEFAULT_OUT = "main_figures/max_wind_histogram.png"
-DEFAULT_BASIN_OUT = "supplements/max_wind_histogram_by_basin.png"
-DEFAULT_IKE_OUT = "main_figures/ike_histogram.png"
-DEFAULT_IKE_BASIN_OUT = "supplements/ike_histogram_by_basin.png"
+DEFAULT_OUT = str(MAIN_FIGURES_DIR / "max_wind_histogram.png")
+DEFAULT_BASIN_OUT = str(SUPPLEMENTS_DIR / "max_wind_histogram_by_basin.png")
+DEFAULT_IKE_OUT = str(MAIN_FIGURES_DIR / "ike_histogram.png")
+DEFAULT_IKE_BASIN_OUT = str(SUPPLEMENTS_DIR / "ike_histogram_by_basin.png")
+CACHE_SUBDIR = Path(__file__).stem
 
 PERFECT_PRED_LABEL = "Perfect prediction"
 HIRO_ACE_LABEL = "HiRO-ACEv2"
@@ -472,6 +480,57 @@ def collect_track_target(
 
 
 # --------------------------------------------------------------------------- #
+# Plot-data cache: one npz per series, holding each track's peaks flattened
+# in track order (split back apart by the per-track sample counts).
+# --------------------------------------------------------------------------- #
+def _ike_tag(ike: IkeSpec) -> str:
+    """Cache-name fragment for every IkeSpec field, so non-default IKE options
+    never pick up another definition's cached values."""
+    def fmt(value):
+        return "none" if value is None else f"{value:g}"
+
+    return f"ike_box{ike.box_deg:g}_min{fmt(ike.min_wind)}_max{fmt(ike.max_wind)}"
+
+
+def _peaks_to_arrays(wind_peaks: dict, ike_peaks: dict, basin_by_idx: dict) -> dict:
+    idxs = list(wind_peaks)
+    return {
+        "idx": np.array(idxs, dtype=str),
+        # "" stands for a track outside every basin box (basin None).
+        "basin": np.array([basin_by_idx[idx] or "" for idx in idxs], dtype=str),
+        "wind_n": np.array([len(wind_peaks[idx]) for idx in idxs]),
+        "wind": np.concatenate([wind_peaks[idx] for idx in idxs]),
+        "ike_n": np.array([len(ike_peaks[idx]) for idx in idxs]),
+        "ike": np.concatenate([ike_peaks[idx] for idx in idxs]),
+    }
+
+
+def _arrays_to_peaks(arrays: dict) -> tuple[dict, dict, dict]:
+    idxs = [str(idx) for idx in arrays["idx"]]
+    wind = np.split(arrays["wind"], np.cumsum(arrays["wind_n"])[:-1])
+    ike_val = np.split(arrays["ike"], np.cumsum(arrays["ike_n"])[:-1])
+    return (
+        dict(zip(idxs, wind)),
+        dict(zip(idxs, ike_val)),
+        {idx: (str(basin) or None) for idx, basin in zip(idxs, arrays["basin"])},
+    )
+
+
+def load_track_peaks(
+    kind: str, directory: Path, ike: IkeSpec, max_workers: int, refresh: bool = False
+) -> tuple[dict, dict, dict]:
+    """Cached ``collect_track_predicted`` (``kind="predicted"``) or
+    ``collect_track_target`` (``kind="target"``) for ``directory``."""
+    collect = {"predicted": collect_track_predicted, "target": collect_track_target}[kind]
+    arrays = cached_arrays(
+        f"{CACHE_SUBDIR}/{directory.name}_{kind}_{_ike_tag(ike)}.npz",
+        lambda: _peaks_to_arrays(*collect(directory, ike, max_workers)),
+        refresh,
+    )
+    return _arrays_to_peaks(arrays)
+
+
+# --------------------------------------------------------------------------- #
 # Histogram-binning helpers, copied unmodified from
 # 2026-07-16-tc-tracks-prod/plot_max_wind_histogram.py -- used only by this
 # script among this directory's max-snapshot scripts.
@@ -825,6 +884,11 @@ def main() -> None:
         default=16,
         help="Worker processes for reading/reducing tracks in parallel (default: 16).",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Recompute the cached per-track peaks from the snapshot files.",
+    )
     args = parser.parse_args()
 
     # 0 spells "no threshold" on the command line.
@@ -843,8 +907,8 @@ def main() -> None:
     labels = [PERFECT_PRED_LABEL, HIRO_ACE_LABEL, REFERENCE_LABEL]
     colors = series_colors(labels)
 
-    hiro_ace_wind, hiro_ace_ike, hiro_ace_basin = collect_track_predicted(
-        hiro_ace_dir, ike, args.max_workers
+    hiro_ace_wind, hiro_ace_ike, hiro_ace_basin = load_track_peaks(
+        "predicted", hiro_ace_dir, ike, args.max_workers, args.refresh
     )
 
     wind_by_series = [(HIRO_ACE_LABEL, hiro_ace_wind)]
@@ -853,8 +917,8 @@ def main() -> None:
     ike_by_series_basin = [(HIRO_ACE_LABEL, hiro_ace_ike, hiro_ace_basin)]
 
     if not args.no_reference:
-        reference_wind, reference_ike, reference_basin = collect_track_target(
-            perfect_pred_dir, ike, args.max_workers
+        reference_wind, reference_ike, reference_basin = load_track_peaks(
+            "target", perfect_pred_dir, ike, args.max_workers, args.refresh
         )
         wind_by_series.append((REFERENCE_LABEL, reference_wind))
         ike_by_series.append((REFERENCE_LABEL, reference_ike))
